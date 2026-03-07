@@ -16,12 +16,28 @@ class PARSEQ:
                  model_path: str,
                  charlist: [str],
                  original_size: Tuple[int, int] = (384, 32),
-                 device: str = "CPU") -> None:
+                 device: str = "CPU",
+                 tcy_min_line_width: int = 30,
+                 tcy_det_margin_ratio: float = 0.1,
+                 tcy_ocr_margin_ratio: float = 0.5,
+                 tcy_min_components: int = 2,
+                 tcy_max_aspect_ratio: float = 1.0,
+                 tcy_seg_min_gap: int = 5,
+                 tcy_ink_threshold_ratio: float = 0.10) -> None:
         self.model_path = model_path
         self.charlist = charlist
 
         self.device = device
         self.image_width, self.image_height = original_size
+
+        self.tcy_min_line_width = tcy_min_line_width
+        self.tcy_det_margin_ratio = tcy_det_margin_ratio
+        self.tcy_ocr_margin_ratio = tcy_ocr_margin_ratio
+        self.tcy_min_components = tcy_min_components
+        self.tcy_max_aspect_ratio = tcy_max_aspect_ratio
+        self.tcy_seg_min_gap = tcy_seg_min_gap
+        self.tcy_ink_threshold_ratio = tcy_ink_threshold_ratio
+
         self.create_session()
 
     def create_session(self) -> None:
@@ -95,8 +111,8 @@ class PARSEQ:
         text = "".join([self.charlist[i - 1] for i in char_indices])
         return text, confidences
 
-    @staticmethod
-    def _segment_blocks(img: np.ndarray, min_gap: int = 5) -> List[Tuple[int, int]]:
+    def _segment_blocks(self, img: np.ndarray) -> List[Tuple[int, int]]:
+        min_gap = self.tcy_seg_min_gap
         if img.ndim == 3:
             gray = np.mean(img, axis=2).astype(np.uint8)
         else:
@@ -125,8 +141,7 @@ class PARSEQ:
                 merged.append(b)
         return merged
 
-    @staticmethod
-    def _count_horizontal_components(segment: np.ndarray) -> int:
+    def _count_horizontal_components(self, segment: np.ndarray) -> int:
         if segment.ndim == 3:
             gray = np.mean(segment, axis=2).astype(np.uint8)
         else:
@@ -136,7 +151,7 @@ class PARSEQ:
         col_sum = np.sum(binary, axis=0)
         if col_sum.max() == 0:
             return 0
-        ink_threshold = col_sum.max() * 0.10
+        ink_threshold = col_sum.max() * self.tcy_ink_threshold_ratio
         is_ink = col_sum > ink_threshold
         components = 0
         in_component = False
@@ -154,58 +169,65 @@ class PARSEQ:
         if not full_text:
             return full_text
         blocks = self._segment_blocks(img)
-        if not blocks:
+        if not blocks or w < self.tcy_min_line_width:
             return full_text
-        patches: List[Tuple[int, int, str, List[float]]] = []
+
+        # Classify each block as tate-chuu-yoko candidate
+        # Use small margin for detection to avoid including neighboring blocks
+        tcy_flags: List[bool] = []
         for y_start, y_end in blocks:
             block_height = y_end - y_start
-            margin = max(2, int(block_height * 0.1))
-            y0 = max(0, y_start - margin)
-            y1 = min(h, y_end + margin)
+            det_margin = max(2, int(block_height * self.tcy_det_margin_ratio))
+            y0 = max(0, y_start - det_margin)
+            y1 = min(h, y_end + det_margin)
             block_img = img[y0:y1, :, :] if img.ndim == 3 else img[y0:y1, :]
-            if self._count_horizontal_components(block_img) < 2:
-                continue
-            if block_img.ndim == 2:
-                block_img = np.stack([block_img] * 3, axis=-1)
-            seg_text, seg_conf = self._read_with_confidence(block_img, rotate=False)
-            if not seg_text:
-                continue
-            ratio_start = y_start / h
-            ratio_end = y_end / h
-            n_chars = len(full_text)
-            char_start = max(0, int(round(ratio_start * n_chars)))
-            char_end = min(n_chars, int(round(ratio_end * n_chars)))
-            if char_end <= char_start:
-                char_end = char_start + 1
-            if char_start < len(full_conf):
-                region_conf = full_conf[char_start:char_end]
-                avg_full_conf = np.mean(region_conf) if len(region_conf) > 0 else 0.0
-            else:
-                avg_full_conf = 0.0
-            avg_seg_conf = np.mean(seg_conf) if seg_conf else 0.0
-            if avg_seg_conf > avg_full_conf:
-                patches.append((char_start, char_end, seg_text, seg_conf))
-        if not patches:
+            is_tcy = (self._count_horizontal_components(block_img) >= self.tcy_min_components
+                       and block_height <= w * self.tcy_max_aspect_ratio)
+            tcy_flags.append(is_tcy)
+
+        if not any(tcy_flags):
             return full_text
-        patches.sort(key=lambda p: p[0])
-        resolved: List[Tuple[int, int, str, List[float]]] = []
-        for patch in patches:
-            if resolved and patch[0] < resolved[-1][1]:
-                prev = resolved[-1]
-                if np.mean(patch[3]) > np.mean(prev[3]):
-                    resolved[-1] = patch
+
+        # Build block-by-block result
+        block_parts: List[str] = []
+        i = 0
+        n = len(blocks)
+        while i < n:
+            if tcy_flags[i]:
+                y_start, y_end = blocks[i]
+                block_height = y_end - y_start
+                ocr_margin = max(5, int(block_height * self.tcy_ocr_margin_ratio))
+                y0 = max(0, y_start - ocr_margin)
+                y1 = min(h, y_end + ocr_margin)
+                block_img = img[y0:y1, :, :] if img.ndim == 3 else img[y0:y1, :]
+                if block_img.ndim == 2:
+                    block_img = np.stack([block_img] * 3, axis=-1)
+                seg_text, _ = self._read_with_confidence(block_img, rotate=False)
+                block_parts.append(seg_text)
+                i += 1
             else:
-                resolved.append(patch)
-        result_parts: List[str] = []
-        pos = 0
-        for char_start, char_end, seg_text, _ in resolved:
-            if pos < char_start:
-                result_parts.append(full_text[pos:char_start])
-            result_parts.append(seg_text)
-            pos = char_end
-        if pos < len(full_text):
-            result_parts.append(full_text[pos:])
-        return "".join(result_parts)
+                group_start = i
+                while i < n and not tcy_flags[i]:
+                    i += 1
+                if group_start > 0 and tcy_flags[group_start - 1]:
+                    crop_y0 = blocks[group_start - 1][1]
+                else:
+                    crop_y0 = blocks[group_start][0]
+                if i < n and tcy_flags[i]:
+                    crop_y1 = blocks[i][0]
+                else:
+                    crop_y1 = blocks[i - 1][1]
+                group_img = img[crop_y0:crop_y1, :, :] if img.ndim == 3 else img[crop_y0:crop_y1, :]
+                if group_img.shape[0] > 0 and group_img.shape[1] > 0:
+                    group_text, _ = self._read_with_confidence(group_img, rotate=True)
+                    block_parts.append(group_text)
+
+        # If block-by-block result has more characters, it likely recovered
+        # tate-chuu-yoko text that the full rotated OCR missed.
+        block_text = "".join(block_parts)
+        if len(block_text) > len(full_text):
+            return block_text
+        return full_text
 
     def read(self, img: np.ndarray) -> List:
         if img is None:
