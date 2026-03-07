@@ -99,7 +99,14 @@ def get_recognizer(args,weights_path=None):
         charobj=safe_load(f)
     charlist=list(charobj["model"]["charset_train"])
     
-    recognizer = PARSEQ(model_path=weights_path,charlist=charlist,device=args.device)
+    tcy_kwargs = {}
+    for attr in ["tcy_min_line_width", "tcy_det_margin_ratio", "tcy_ocr_margin_ratio",
+                 "tcy_min_components", "tcy_max_aspect_ratio", "tcy_seg_min_gap",
+                 "tcy_ink_threshold_ratio"]:
+        val = getattr(args, attr, None)
+        if val is not None:
+            tcy_kwargs[attr] = val
+    recognizer = PARSEQ(model_path=weights_path,charlist=charlist,device=args.device,**tcy_kwargs)
     return recognizer
 
 
@@ -292,6 +299,13 @@ def main():
     parser.add_argument("--rec-weights", type=str, required=False, help="Path to parseq-tiny onnx file", default=str(base_dir / "model" / "parseq-ndl-16x768-100-tiny-165epoch-tegaki2.onnx"))
     parser.add_argument("--rec-classes", type=str, required=False, help="Path to list of class in yaml file", default=str(base_dir / "config" / "NDLmoji.yaml"))
     parser.add_argument("--device", type=str, required=False, help="Device use (cpu or cuda)", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--tcy-min-line-width", type=int, required=False, dest="tcy_min_line_width", default=30, help="Minimum line width (px) to attempt tate-chuu-yoko detection")
+    parser.add_argument("--tcy-det-margin-ratio", type=float, required=False, dest="tcy_det_margin_ratio", default=0.1, help="Margin ratio for tate-chuu-yoko candidate detection")
+    parser.add_argument("--tcy-ocr-margin-ratio", type=float, required=False, dest="tcy_ocr_margin_ratio", default=0.5, help="Margin ratio for tate-chuu-yoko OCR")
+    parser.add_argument("--tcy-min-components", type=int, required=False, dest="tcy_min_components", default=2, help="Minimum horizontal components to flag as tate-chuu-yoko")
+    parser.add_argument("--tcy-max-aspect-ratio", type=float, required=False, dest="tcy_max_aspect_ratio", default=1.0, help="Maximum block height/width ratio for tate-chuu-yoko")
+    parser.add_argument("--tcy-seg-min-gap", type=int, required=False, dest="tcy_seg_min_gap", default=5, help="Minimum gap (px) between ink blocks in segmentation")
+    parser.add_argument("--tcy-ink-threshold-ratio", type=float, required=False, dest="tcy_ink_threshold_ratio", default=0.10, help="Ink threshold ratio for horizontal component counting")
     args = parser.parse_args()
     process(args)
 
